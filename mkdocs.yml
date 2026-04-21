@@ -1,0 +1,137 @@
+site_name: Trackers
+site_url: !ENV [SITE_URL, "https://trackers.roboflow.com/latest/"]
+site_author: Roboflow
+site_description: A unified library for object tracking featuring clean room re-implementations of leading multi-object tracking algorithms.
+repo_name: roboflow/trackers
+repo_url: https://github.com/roboflow/trackers
+edit_uri: https://github.com/roboflow/trackers/tree/main/docs
+copyright: Roboflow 2026. All rights reserved.
+
+hooks:
+  - docs/hooks/doctest_filter.py
+  - docs/hooks/schema_inject.py
+
+extra:
+  version:
+    provider: mike
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/roboflow
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/trackers
+    - icon: fontawesome/brands/docker
+      link: https://hub.docker.com/u/roboflow
+    - icon: fontawesome/brands/youtube
+      link: https://www.youtube.com/roboflow
+    - icon: fontawesome/brands/linkedin
+      link: https://www.linkedin.com/company/roboflow-ai/
+    - icon: fontawesome/brands/x-twitter
+      link: https://twitter.com/roboflow
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/GbfgXGJ8Bk
+
+theme:
+  name: material
+  custom_dir: docs/overrides/
+  icon:
+    edit: material/pencil
+  logo: assets/logo-trackers-violet.svg
+  favicon: assets/logo-trackers-black.svg
+  features:
+    - content.code.annotate
+    - content.code.copy
+    - content.code.select
+    - content.tabs.link
+    - content.tooltips
+    - navigation.footer
+    - navigation.tracking
+    - navigation.expand
+    - navigation.tabs
+
+extra_css:
+  - stylesheets/style.css
+  - stylesheets/rf.css
+  - stylesheets/command_builder.css
+
+extra_javascript:
+  - javascripts/pycon_copy.js
+  - javascripts/cli_builder_framework.js
+  - javascripts/command_builder.js
+
+markdown_extensions:
+   # Adds support for card grids
+  - attr_list
+  - md_in_html
+  # Enables the use of icons and emojis
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  # Code syntax highlighting with line numbers and anchors
+  - pymdownx.highlight:
+      # Adds anchors to line numbers
+      anchor_linenums: true
+      # Wraps lines in span elements
+      line_spans: __span
+      # Adds language class to code blocks
+      pygments_lang_class: true
+  # Enables inline code highlighting
+  - pymdownx.inlinehilite
+  # Allows including content from other files
+  - pymdownx.snippets
+  # Enables nested code blocks and custom fences
+  - pymdownx.superfences
+  # Adds support for callouts/notes/warnings
+  - admonition
+  # Enables collapsible blocks (expandable content)
+  - pymdownx.details
+  # Creates tabbed content (like installation examples)
+  - pymdownx.tabbed:
+      # Uses an alternative styling for tabs
+      alternate_style: true
+
+plugins:
+  - search
+  - git-revision-date-localized:
+      enable_creation_date: true
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            # Controls whether to show symbol types in the table of contents
+            show_symbol_type_toc: true
+            # Controls whether to show symbol type in the heading
+            show_symbol_type_heading: true
+            # Controls whether to show the root heading (module/class name)
+            show_root_heading: true
+            # Controls whether to show the source code
+            show_source: false
+            # Specifies the docstring style to parse (Google style in this case)
+            docstring_style: google
+            # Controls the order of members (by source order in this case)
+            members_order: source
+
+            extra:
+              # Controls whether to sort members alphabetically
+              sort_members: false
+
+nav:
+  - Home:
+    - Quickstart: index.md
+  - Guides:
+    - Install Trackers: learn/install.md
+    - Track Objects: learn/track.md
+    - Download Datasets: learn/download.md
+    - Evaluate Trackers: learn/evaluate.md
+    - Detection Quality Matters: learn/detection-quality.md
+    - About: learn/about.md
+  - Trackers:
+    - Comparison: trackers/comparison.md
+    - SORT: trackers/sort.md
+    - ByteTrack: trackers/bytetrack.md
+    - OC-SORT: trackers/ocsort.md
+  - API Reference:
+    - Trackers: api/trackers.md
+    - Motion: api/motion.md
+    - Datasets: api/datasets.md
+    - Evals: api/evals.md
+    - I/O: api/io.md

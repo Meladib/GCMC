@@ -24,6 +24,7 @@ class Dataset(str, Enum):
 
     MOT17 = "mot17"
     SPORTSMOT = "sportsmot"
+    DANCETRACK = "dancetrack"
 
 
 class DatasetSplit(str, Enum):

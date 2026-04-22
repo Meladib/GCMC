@@ -14,7 +14,7 @@ from trackers.core.ocsort.utils import (
     _build_direction_consistency_matrix_batch,
     _get_iou_matrix,
 )
-from trackers.utils.state_representations import XCYCSRStateEstimator
+from trackers.utils.state_representations import XCYCSRStateEstimator, XYXYStateEstimator
 
 
 class OCSORTTracker(BaseTracker):
@@ -63,6 +63,7 @@ class OCSORTTracker(BaseTracker):
 
     def __init__(
         self,
+        state_estimator_class: type = XYXYStateEstimator,
         lost_track_buffer: int = 30,
         frame_rate: float = 30.0,
         minimum_consecutive_frames: int = 3,
@@ -83,7 +84,8 @@ class OCSORTTracker(BaseTracker):
 
         self.tracks: list[OCSORTTracklet] = []
         self.frame_count = 0
-        self.state_estimator_class = XCYCSRStateEstimator
+        self.state_estimator_class = state_estimator_class
+        #self.state_estimator_class = XCYCSRStateEstimator
 
     def _get_associated_indices(
         self,

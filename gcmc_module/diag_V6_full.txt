@@ -133,7 +133,7 @@
      Gap to optimal: 5.6325
      σ²/MSE ratio: 232.6x
      ⚠ CRITICAL: σ² is 233× larger than optimal
-        Fix: Lower softplus floor from +1e-2 to +1e-6
+        
 
   ── D. Gradient flow problem (theoretical)
      NLL = error_term + uncertainty_term
@@ -208,16 +208,16 @@
      σ²/MSE ratio: e1=54.8 e50=234.1 e100=232.6
      ⚠ CRITICAL: σ² is 233× larger than MSE
        Optimal ratio: ~1.0x
-       Fix: Lower softplus floor from +1e-2 to +1e-6
+       
 
   ── I. Epoch-50 gate check
      corr_ratio@50: 0.3182  ✓ PASS >0.15
-     → CorrR peaked and decayed — fix σ² floor
+     
 
   ── F. Research verdict
      ⚠ PEAK+DECAY: CorrR peaked at 28 then collapsed
        Root cause: σ² floor too high (ratio=233×)
-       Fix: Lower floor to +1e-6, retrain from epoch 28
+       
 
 ══════════════════════════════════════════════════════════════════════
 

@@ -1,15 +1,26 @@
 """
-diagnose_gcmc.py — Comprehensive GCMC Diagnostic (v4-aware)
-============================================================
-Updated for 20-dim architecture: neighbourhood (12) + own-state (8)
+diagnose_gcmc.py — GCMC Diagnostic v9
+======================================
+V9 changes vs v3:
+  - DIM_NAMES 8-9: pos_spread_x/y (was nb_gvx/gvy)
+  - _build_features: pos_spread replaces group_vel, vel_dev replaces own_vel in states_rel
+  - _normalize: dims 8-9 use POS_SCALE (was VEL_SCALE)
+  - §3: CorrR reads from 'corr_ratio' key (fixes zero-read bug)
+  - §5D: confidence gate sweep (replaces pixel threshold sweep)
+  - §6: failure taxonomy uses confidence gate
+  - §7: recommendations updated — implemented items removed
 
 Usage:
-    python diagnose_gcmc.py --residuals residuals --log checkpoints_v5/training_log.json --mode full
+    python diagnose_gcmc.py --residuals residuals --log checkpoints_v9/training_log.json --mode full
+    python diagnose_gcmc.py --residuals residuals --log checkpoints_v9/training_log.json \
+        --checkpoint checkpoints_v9/gcmc_best.pt --mode report
+    python diagnose_gcmc.py --residuals residuals --mode compare \
+        --log checkpoints_v7/training_log.json --log2 checkpoints_v9/training_log.json
 """
-
-import argparse
-import json
+from __future__ import annotations
+import argparse, json, sys
 from pathlib import Path
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -17,489 +28,707 @@ import torch
 SEP  = '─' * 70
 SEP2 = '═' * 70
 
+POS_SCALE        = 0.2257
+VEL_SCALE        = 0.0022
+DV_STD           = np.array([0.004789, 0.006376], dtype=np.float32)
+DV_CONF_THRESHOLD = 1.0   # V9 confidence gate threshold
 
-# ─────────────────────────────────────────────────────────────────────────────
+# V9 dim names — dims 8-9 now pos_spread, dims 16-19 now vel_deviation
+DIM_NAMES = [
+    'nb_μ_dx',     'nb_μ_dy',     'nb_μ_dvx',  'nb_μ_dvy',
+    'nb_σ_dx',     'nb_σ_dy',     'nb_σ_dvx',  'nb_σ_dvy',
+    'pos_spread_x','pos_spread_y','vel_dev_x',  'vel_dev_y',   # V9: was gvx,gvy,devx,devy
+    'own_x1',      'own_y1',      'own_x2',     'own_y2',
+    'vel_devx1',   'vel_devy1',   'vel_devx2',  'vel_devy2',   # V9: own_vel - group_vel
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _trend(values: list[float], window: int = 5) -> float:
-    if len(values) < window:
-        return 0.0
-    x = np.arange(window)
-    y = np.array(values[-window:])
+def _trend(values, window=5):
+    if len(values) < window: return 0.0
+    x = np.arange(window); y = np.array(values[-window:])
     return float(np.polyfit(x, y, 1)[0])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 1: Target Characterization
-# ─────────────────────────────────────────────────────────────────────────────
+def _load_all_residuals(res_dir, split='train', max_seqs=None):
+    split_dir = Path(res_dir) / split
+    if not split_dir.exists(): return []
+    files = sorted(split_dir.glob('*.npz'))
+    if max_seqs: files = files[:max_seqs]
+    out = []
+    for f in files:
+        d = np.load(f, allow_pickle=True)
+        for s, dv in zip(d['states_norm'], d['dv_star']):
+            s  = np.array(s,  dtype=np.float32)
+            dv = np.array(dv, dtype=np.float32)
+            if len(s) >= 2:
+                out.append((s, dv, f.stem))
+    return out
 
-def analyze_data(res_dir: Path):
+
+def _build_features(states):
+    """V9 feature construction — matches gcmc.py V9 forward()."""
+    N   = len(states)
+    pos = (states[:, :2] + states[:, 2:4]) / 2.0
+    vel = (states[:, 4:6] + states[:, 6:8]) / 2.0
+
+    dpos = pos[:, None] - pos[None, :]
+    dvel = vel[:, None] - vel[None, :]
+    f_ij = np.concatenate([dpos, dvel], axis=-1)
+
+    dist = np.sqrt((dpos**2).sum(-1) + 1e-8)
+    np.fill_diagonal(dist, 1e9)
+    tau  = 0.05
+    logits = -dist / tau
+    logits -= logits.max(axis=1, keepdims=True)
+    alpha  = np.exp(logits); alpha /= alpha.sum(axis=1, keepdims=True)
+
+    mu    = np.einsum('ij,ijd->id', alpha, f_ij)
+    diff2 = (f_ij - mu[:, None])**2
+    sigma = np.sqrt(np.einsum('ij,ijd->id', alpha, diff2) + 1e-6)
+
+    group_vel  = vel.mean(axis=0, keepdims=True).repeat(N, axis=0)
+    vel_dev    = vel - group_vel                            # (N,2) — dims 10-11
+    # V9: pos_spread replaces group_vel (dims 8-9)
+    pos_spread = vel.std(axis=0, keepdims=True).repeat(N, axis=0)  # broadcast same shape
+
+    f_nb = np.concatenate([mu, sigma, pos_spread, vel_dev], axis=-1)  # (N,12)
+
+    # V9: own vel as deviation from group
+    states_rel = states.copy()
+    states_rel[:, 4:6] = states[:, 4:6] - group_vel
+    states_rel[:, 6:8] = states[:, 6:8] - group_vel
+
+    f_i = np.concatenate([f_nb, states_rel], axis=-1)  # (N,20)
+    return f_i, alpha
+
+
+def _normalize_features(f_i):
+    """V9 normalisation — dims 8-9 use POS_SCALE (was VEL_SCALE)."""
+    f = f_i.copy()
+    f[:, 0:2]  /= POS_SCALE
+    f[:, 2:4]  /= VEL_SCALE
+    f[:, 4:6]  /= POS_SCALE
+    f[:, 6:8]  /= VEL_SCALE
+    f[:, 8:10] /= POS_SCALE   # V9: pos_spread → POS_SCALE
+    f[:, 10:12] /= VEL_SCALE
+    f[:, 12:16] /= POS_SCALE
+    f[:, 16:20] /= VEL_SCALE
+    return f
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1: Residual Data Analysis
+# ══════════════════════════════════════════════════════════════════════════════
+
+def analyze_data(res_dir):
     print(f'\n{SEP2}')
     print('  SECTION 1: RESIDUAL DATA ANALYSIS')
     print(SEP2)
 
     for split in ['train', 'val']:
-        split_dir = res_dir / split
-        if not split_dir.exists():
-            continue
+        frames = _load_all_residuals(res_dir, split)
+        if not frames: continue
 
-        all_dv, all_states, all_vel, group_sizes = [], [], [], []
-        n_zero_vel_frames = 0
-        n_total_frames    = 0
-        n_cold_frames     = 0
+        all_dv_mag, all_vel_mag, group_sizes = [], [], []
+        n_cold = 0
+        seq_counts = defaultdict(int)
 
-        for npz in sorted(split_dir.glob('*.npz')):
-            d = np.load(npz, allow_pickle=True)
-            for s, dv in zip(d['states_norm'], d['dv_star']):
-                s  = np.array(s,  dtype=np.float32)
-                dv = np.array(dv, dtype=np.float32)
-                all_dv.append(dv)
-                all_states.append(s)
+        for s, dv, seq in frames:
+            dv_mag  = np.linalg.norm(dv, axis=1)
+            vel     = (s[:, 4:6] + s[:, 6:8]) / 2.0
+            vel_mag = np.sqrt((vel**2).sum(-1))
+            all_dv_mag.extend(dv_mag.tolist())
+            all_vel_mag.extend(vel_mag.tolist())
+            group_sizes.append(len(s))
+            if vel_mag.max() < 1e-4: n_cold += 1
+            seq_counts[seq] += 1
 
-                vc = ((s[:, 4] + s[:, 6]) / 2, (s[:, 5] + s[:, 7]) / 2)
-                vel_mag = np.sqrt(vc[0]**2 + vc[1]**2)
-                all_vel.extend(vel_mag.tolist())
-                group_sizes.append(len(s))
+        dv_arr  = np.array(all_dv_mag)
+        vel_arr = np.array(all_vel_mag)
+        gs_arr  = np.array(group_sizes)
 
-                if vel_mag.max() < 1e-6:
-                    n_zero_vel_frames += 1
-                n_total_frames += 1
-
-                if np.abs((s[:, 4] + s[:, 6]) / 2).max() < 1e-4:
-                    n_cold_frames += 1
-
-        dv_flat = np.concatenate(all_dv, axis=0)
-        vel_arr  = np.array(all_vel)
-        gs_arr   = np.array(group_sizes)
-        dv_mag   = np.linalg.norm(dv_flat, axis=1)
+        noise_floor = np.percentile(dv_arr, 50)
+        signal      = np.percentile(dv_arr, 95)
+        snr         = signal / max(noise_floor, 1e-8)
 
         print(f'\n  [{split.upper()}]')
         print(f'  {SEP}')
-
-        print(f'\n  ── A. Residual Δv* distribution')
-        print(f'     Total samples      : {len(dv_flat):,}')
-        print(f'     Mean |Δv*|         : {dv_mag.mean():.6f}  (norm)')
-        print(f'     Std  |Δv*|         : {dv_mag.std():.6f}')
-        print(f'     Median |Δv*|       : {np.median(dv_mag):.6f}')
-        print(f'     p75  |Δv*|         : {np.percentile(dv_mag, 75):.6f}')
-        print(f'     p95  |Δv*|         : {np.percentile(dv_mag, 95):.6f}')
-        print(f'     Max  |Δv*|         : {dv_mag.max():.6f}')
-        print(f'     % samples < 0.001  : {(dv_mag < 0.001).mean()*100:.1f}%')
-        print(f'     % samples < 0.005  : {(dv_mag < 0.005).mean()*100:.1f}%')
-        print(f'     % samples > 0.05   : {(dv_mag > 0.05).mean()*100:.1f}%')
-
-        print(f'\n  ── B. KF velocity state distribution')
-        print(f'     Mean |vc_KF|       : {vel_arr.mean():.6f}')
-        print(f'     Median |vc_KF|     : {np.median(vel_arr):.6f}')
-        print(f'     % frames with vc≈0 : {(vel_arr < 1e-6).mean()*100:.1f}%')
-        print(f'     Frames ALL-zero-vel: {n_zero_vel_frames}/{n_total_frames} '
-              f'({n_zero_vel_frames/max(n_total_frames,1)*100:.1f}%)')
-
-        print(f'\n  ── C. Group size distribution')
-        print(f'     Mean tracks/frame  : {gs_arr.mean():.1f}')
-        print(f'     Median             : {np.median(gs_arr):.1f}')
-        print(f'     % frames k<5       : {(gs_arr < 5).mean()*100:.1f}%')
-        print(f'     % frames k≥10      : {(gs_arr >= 10).mean()*100:.1f}%')
-        print(f'     Max                : {gs_arr.max()}')
-
-        pct_cold = n_cold_frames / len(all_states) * 100
-        print(f'\n  ── C2. Cold frame prevalence')
-        print(f'     Cold frames (all vc≈0): {pct_cold:.1f}% of data')
-        print(f'     {"⚠ High — MLP learning on dead features" if pct_cold > 20 else "✓ OK"}')
-
-        # ── Feature informativeness ─────────────────────────────────
-        print(f'\n  ── D. Feature informativeness (can f_i predict Δv*?)')
-        
-        # For v4: analyze both neighbour features AND own-state
-        pos_spreads, vel_spreads, own_vel_mags, own_pos_mags = [], [], [], []
-        for s, dv in zip(all_states[:500], all_dv[:500]):
-            cx = (s[:, 0] + s[:, 2]) / 2
-            cy = (s[:, 1] + s[:, 3]) / 2
-            pos_spreads.append(np.std(cx) + np.std(cy))
-            
-            vx = (s[:, 4] + s[:, 6]) / 2
-            vy = (s[:, 5] + s[:, 7]) / 2
-            vel_spreads.append(np.std(vx) + np.std(vy))
-            
-            # Own-state: per-track velocity magnitude
-            own_vel_mags.extend(np.sqrt(vx**2 + vy**2).tolist())
-            own_pos_mags.extend(np.sqrt(cx**2 + cy**2).tolist())
-
-        dv_sample = np.linalg.norm(np.concatenate(all_dv[:500]), axis=1)
-        ps = np.array(pos_spreads)
-
-        # Correlation: pos_spread vs |Δv*|
-        if len(ps) == len(dv_sample[:len(ps)]):
-            corr_pos = np.corrcoef(ps, dv_sample[:len(ps)])[0, 1]
-            print(f'     Corr(pos_spread, |Δv*|): {corr_pos:.4f}  '
-                  f'{"✓ informative" if abs(corr_pos) > 0.1 else "⚠ weak signal"}')
-
-        # Correlation: vel_spread vs |Δv*|
-        vs = np.array(vel_spreads)
-        if len(vs) == len(dv_sample[:len(vs)]):
-            corr_vel = np.corrcoef(vs, dv_sample[:len(vs)])[0, 1]
-            print(f'     Corr(vel_spread, |Δv*|): {corr_vel:.4f}  '
-                  f'{"✓ informative" if abs(corr_vel) > 0.1 else "⚠ weak signal"}')
-
-        # NEW: Correlation: own-state velocity vs |Δv*| (the critical v4 signal)
-        own_vel_arr = np.array(own_vel_mags[:len(dv_sample)])
-        if len(own_vel_arr) == len(dv_sample):
-            corr_own = np.corrcoef(own_vel_arr, dv_sample)[0, 1]
-            print(f'     Corr(|own_vel|, |Δv*|):  {corr_own:.4f}  '
-                  f'{"✓ CRITICAL SIGNAL for v4" if abs(corr_own) > 0.1 else "⚠ weak signal"}')
-
-        print(f'     Mean vel spread in f_ij : {vs.mean():.6f}')
-        print(f'     Mean pos spread in f_ij : {ps.mean():.6f}')
-        print(f'     Vel/Pos ratio           : {vs.mean()/max(ps.mean(), 1e-8):.4f}')
-
-        # ── SNR ─────────────────────────────────────────────────────
-        noise_floor = np.percentile(dv_mag, 50)
-        signal      = np.percentile(dv_mag, 95)
-        snr = signal / max(noise_floor, 1e-8)
-        print(f'\n  ── E. Learning difficulty (SNR)')
-        print(f'     Noise floor (p50)  : {noise_floor:.6f}')
-        print(f'     Signal (p95)       : {signal:.6f}')
-        print(f'     SNR (p95/p50)      : {snr:.2f}x')
+        print(f'  Frames           : {len(frames):,}  |  Tracks: {len(dv_arr):,}')
+        print(f'  Sequences        : {len(seq_counts)}')
+        print(f'  Group size       : mean={gs_arr.mean():.1f}  med={np.median(gs_arr):.0f}  '
+              f'p5={np.percentile(gs_arr,5):.0f}  p95={np.percentile(gs_arr,95):.0f}')
+        print(f'  Cold frames (v=0): {n_cold} / {len(frames)} ({100*n_cold/len(frames):.1f}%)')
+        print(f'\n  Target |Δv*| distribution:')
+        for pct in [25, 50, 75, 90, 95, 99]:
+            print(f'     p{pct:<3}: {np.percentile(dv_arr, pct):.6f}')
+        print(f'  SNR (p95/p50)    : {snr:.2f}x')
         if snr < 5:
-            print(f'     ⚠ LOW SNR — sparse signal, zero-init dangerous')
+            print(f'  ⚠ LOW SNR — sparse signal, zero-init dangerous')
+
+        print(f'\n  Speed-stratified signal (|Δv*| p95 per speed bin):')
+        for lo, hi in [(0, 0.001), (0.001, 0.005), (0.005, 0.02), (0.02, 1.0)]:
+            mask = (vel_arr >= lo) & (vel_arr < hi)
+            if mask.sum() > 10:
+                sig_bin = np.percentile(dv_arr[mask], 95)
+                nf_bin  = np.percentile(dv_arr[mask], 50)
+                print(f'     vel [{lo:.3f},{hi:.3f}): n={mask.sum():5d}  '
+                      f'p50={nf_bin:.5f}  p95={sig_bin:.5f}  SNR={sig_bin/max(nf_bin,1e-9):.1f}x')
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 2: Model Architecture Analysis (v4-aware)
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2: Model Architecture Analysis
+# ══════════════════════════════════════════════════════════════════════════════
 
-def analyze_model(res_dir: Path, log_path: Path | None = None):
+def analyze_model(res_dir):
     print(f'\n{SEP2}')
-    print('  SECTION 2: MODEL ARCHITECTURE ANALYSIS')
+    print('  SECTION 2: MODEL ARCHITECTURE ANALYSIS (V9 features)')
     print(SEP2)
 
-    npz = sorted((res_dir / 'train').glob('*.npz'))[0]
-    d = np.load(npz, allow_pickle=True)
+    frames = _load_all_residuals(res_dir, 'train', max_seqs=3)
+    if not frames:
+        print('  No training data found.'); return
 
-    # Find warm frame
-    warm_frame = None
-    for s, dv in zip(d['states_norm'], d['dv_star']):
-        s = np.array(s, dtype=np.float32)
-        vc_mag = np.abs((s[:, 4] + s[:, 6]) / 2).max()
-        if vc_mag > 1e-4 and len(s) >= 3:
-            warm_frame = (s, np.array(dv, dtype=np.float32))
-            break
+    warm_frame = cold_frame = None
+    for s, dv, _ in frames:
+        vel = (s[:, 4:6] + s[:, 6:8]) / 2.0
+        vm  = np.sqrt((vel**2).sum(-1)).max()
+        if warm_frame is None and vm > 1e-4 and len(s) >= 3:
+            warm_frame = (s, dv)
+        if cold_frame is None and vm < 1e-5:
+            cold_frame = (s, dv)
 
-    cold_frame = (np.array(d['states_norm'][0], dtype=np.float32),
-                  np.array(d['dv_star'][0],     dtype=np.float32))
+    for label, frame in [('cold', cold_frame), ('warm', warm_frame)]:
+        if frame is None: continue
+        s, dv = frame
+        f_i, alpha = _build_features(s)
+        f_norm     = _normalize_features(f_i)
 
-    print(f'\n  ── A. Feature quality: cold frame (frame 0, all vc=0)')
-    _analyze_features_v4(cold_frame[0], label='cold')
+        print(f'\n  ── Feature stats [{label}]  N={len(s)}')
+        print(f'     {"Dim":<14} {"raw mean":>10} {"norm mean":>10} {"norm std":>10}')
+        print(f'     {"-"*46}')
+        for i, name in enumerate(DIM_NAMES):
+            raw_m  = np.abs(f_i[:, i]).mean()
+            norm_m = np.abs(f_norm[:, i]).mean()
+            norm_s = f_norm[:, i].std()
+            flag   = ' ⚠ dead' if norm_m < 0.01 else ''
+            print(f'     {name:<14} {raw_m:>10.5f} {norm_m:>10.4f} {norm_s:>10.4f}{flag}')
 
-    if warm_frame:
-        print(f'\n  ── B. Feature quality: warm frame (vc > 0)')
-        _analyze_features_v4(warm_frame[0], label='warm')
+        ent = -(alpha * np.log(alpha + 1e-9)).sum(-1).mean()
+        print(f'\n     Attention entropy (mean): {ent:.4f}')
+        if ent < 0.3:
+            print(f'     ⚠ LOW entropy — nearly one-hot, context collapsed')
+        elif ent > 2.0:
+            print(f'     ⚠ HIGH entropy — too diffuse, neighbourhood blurred')
 
-    # Loss landscape
-    print(f'\n  ── C. Loss landscape analysis')
-    print(f'     NLL = sq_err/σ² + log(σ²)')
-    print(f'     Minimum at σ²* = sq_err')
-
-    if log_path and log_path.exists():
-        log = json.loads(log_path.read_text())
-        final_mse = log[-1].get('train_mse', 0)
-        final_sharp = log[-1].get('tr_sharpness', log[-1].get('val_sharpness', 0))
-        final_nll = log[-1].get('train_nll', 0)
-        print(f'     Final train MSE ≈ {final_mse:.6f}')
-        print(f'     Final σ² (sharpness) ≈ {final_sharp:.6f}')
-        print(f'     Final NLL ≈ {final_nll:.4f}')
-        if final_mse > 0:
-            opt_nll = 1 + np.log(final_mse)
-            print(f'     Optimal NLL at this MSE ≈ {opt_nll:.4f}')
-            gap = final_nll - opt_nll
-            print(f'     Gap to optimal: {gap:.4f}')
-            # v4-specific: check if floor is the bottleneck
-            floor_ratio = final_sharp / final_mse if final_mse > 0 else float('inf')
-            print(f'     σ²/MSE ratio: {floor_ratio:.1f}x')
-            if floor_ratio > 100:
-                print(f'     ⚠ CRITICAL: σ² is {floor_ratio:.0f}× larger than optimal')
-                print(f'        Fix: Lower softplus floor from +1e-2 to +1e-6')
-            elif floor_ratio > 10:
-                print(f'     ⚠ σ² inflated — check floor value')
-            else:
-                print(f'     ✓ σ² near optimal')
-    else:
-        print(f'     (No training log provided)')
-
-    print(f'\n  ── D. Gradient flow problem (theoretical)')
-    print(f'     NLL = error_term + uncertainty_term')
-    print(f'     error_term = (dv_pred - dv*)² / σ²')
-    print(f'     If σ² >> MSE, error_term gradients → 0')
-    print(f'     Correction head starves regardless of feature quality')
-
-    print(f'\n  ── E. Feature dimensionality check (v4)')
-    print(f'     f_i ∈ R²⁰ = [μ_pos(2), μ_vel(2), σ_pos(2), σ_vel(2),')
-    print(f'                  group_vel(2), vel_dev(2), own_state(8)]')
-    print(f'     Own-state dims 12-19: direct KF velocity estimate')
-    print(f'     This is the signal that breaks the bottleneck')
-
-    # Gradient check
-    print(f'\n  ── F. Empirical gradient race check')
+    # Gradient race check (untrained)
     try:
-        check_gradient_flow_v4(res_dir)
-    except Exception as e:
-        print(f'     Could not run: {e}')
+        sys.path.insert(0, str(Path(__file__).parent))
+        from gcmc import GCMC, nll_loss as gcmc_nll
+
+        model = GCMC(tau_init=0.05)
+        s_t  = torch.tensor(warm_frame[0] if warm_frame else frames[0][0], dtype=torch.float32)
+        dv_t = torch.tensor(warm_frame[1] if warm_frame else frames[0][1], dtype=torch.float32)
+        dv_pred, sigma2, _ = model(s_t)
+        gcmc_nll(dv_pred, dv_t, sigma2).backward()
+
+        def gnorm(params):
+            gs = [p.grad.norm().item() for p in params if p.grad is not None]
+            return sum(gs) / max(len(gs), 1)
+
+        g_corr = gnorm(model.mlp.correction_head.parameters())
+        g_unc  = gnorm(model.mlp.uncertainty_head.parameters())
+        g_bb   = gnorm(model.mlp.backbone.parameters())
+        ratio  = g_corr / max(g_unc, 1e-12)
+
+        print(f'\n  ── Gradient race (NLL, untrained):')
+        print(f'     correction_head: {g_corr:.6f}')
+        print(f'     uncertainty_head:{g_unc:.6f}')
+        print(f'     backbone:        {g_bb:.6f}')
+        print(f'     corr/unc ratio:  {ratio:.4f}  '
+              f'{"✓ balanced" if 0.1 < ratio < 10 else "⚠ RACE"}')
+
+        w0 = model.mlp.backbone[0].weight
+        if w0.grad is not None and w0.shape[1] == 20:
+            g_nb  = w0.grad[:, :12].norm().item()
+            g_own = w0.grad[:, 12:].norm().item()
+            print(f'     own-state grad:  {g_own:.6f}  (dims 12-19)')
+            print(f'     neighbour grad:  {g_nb:.6f}  (dims 0-11)')
+            print(f'     own/neigh ratio: {g_own/max(g_nb,1e-12):.3f}')
+        print(f'     param count:     {model.count_parameters()}')
+    except ImportError:
+        print('\n  [skip] gcmc.py not importable')
 
 
-def _analyze_features_v4(states: np.ndarray, label: str):
-    """Analyze v4 20-dim features: neighbour (12) + own-state (8)."""
-    N = len(states)
-    pos = (states[:, :2] + states[:, 2:4]) / 2.0
-    vel = (states[:, 4:6] + states[:, 6:8]) / 2.0
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3: Training Log Analysis
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # Neighbourhood features (same as before)
-    dpos = pos[:, None] - pos[None, :]
-    dvel = vel[:, None] - vel[None, :]
-    f_ij = np.concatenate([dpos, dvel], axis=-1)
-
-    tau = 0.05
-    dist = np.sqrt((dpos**2).sum(-1) + 1e-8)
-    np.fill_diagonal(dist, 1e9)
-    logits = -dist / tau
-    logits -= logits.max(axis=1, keepdims=True)
-    alpha = np.exp(logits)
-    alpha /= alpha.sum(axis=1, keepdims=True)
-
-    mu = np.einsum('ij,ijd->id', alpha, f_ij)
-    diff2 = (f_ij - mu[:, None])**2
-    sigma = np.sqrt(np.einsum('ij,ijd->id', alpha, diff2) + 1e-6)
-
-    # v4 additions
-    group_vel = vel.mean(axis=0, keepdims=True).repeat(N, axis=0)
-    vel_dev = vel - group_vel
-
-    f_neighbour = np.concatenate([mu, sigma, group_vel, vel_dev], axis=-1)  # (N, 12)
-    f_i = np.concatenate([f_neighbour, states], axis=-1)  # (N, 20)
-
-    print(f'     [{label}] N={N}')
-    print(f'     Neighbour features (0-11): mean={np.abs(f_neighbour).mean():.6f}')
-    print(f'       μ_pos active: {np.abs(f_neighbour[:, :2]).mean():.6f}')
-    print(f'       μ_vel active: {np.abs(f_neighbour[:, 2:4]).mean():.6f}')
-    print(f'       group_vel:    {np.abs(f_neighbour[:, 8:10]).mean():.6f}')
-    print(f'       vel_dev:      {np.abs(f_neighbour[:, 10:12]).mean():.6f}')
-    print(f'     Own-state (12-19): mean={np.abs(states).mean():.6f}')
-    print(f'       own_pos:      {np.abs(states[:, :4]).mean():.6f}')
-    print(f'       own_vel:      {np.abs(states[:, 4:8]).mean():.6f}')
-    print(f'     → v4 adds 8 dims of direct track state to 12 dims of context')
-
-
-def check_gradient_flow_v4(res_dir: Path):
-    """Check gradients for v4 20-dim model."""
-    from gcmc import GCMC, nll_loss
-
-    npz = sorted((res_dir / 'train').glob('*.npz'))[0]
-    d = np.load(npz, allow_pickle=True)
-
-    states_t, dv_gt_t = None, None
-    for s, dv in zip(d['states_norm'], d['dv_star']):
-        s_arr = np.array(s, dtype=np.float32)
-        if len(s_arr) >= 3:
-            states_t = torch.tensor(s_arr, dtype=torch.float32)
-            dv_gt_t = torch.tensor(np.array(dv, dtype=np.float32), dtype=torch.float32)
-            break
-
-    if states_t is None:
-        print('     No suitable frame found')
-        return
-
-    model = GCMC(tau_init=0.05)
-    dv_pred, sigma2, _ = model(states_t)
-    loss = nll_loss(dv_pred, dv_gt_t, sigma2)
-
-    model.zero_grad()
-    loss.backward()
-
-    corr_norm = sum(p.grad.norm().item() for p in model.mlp.correction_head.parameters() if p.grad is not None)
-    unc_norm = sum(p.grad.norm().item() for p in model.mlp.uncertainty_head.parameters() if p.grad is not None)
-    tau_grad = model.aggregation.log_tau.grad
-    tau_norm = tau_grad.norm().item() if tau_grad is not None else 0.0
-
-    # v4-specific: check own-state encoder gradients (if exists)
-    own_grad = 0.0
-    # Note: v4 doesn't have separate own encoder, but check backbone input grads
-    if hasattr(model.mlp.backbone[0], 'weight') and model.mlp.backbone[0].weight.grad is not None:
-        # Gradient magnitude on first layer weights for own-state dims (12-19)
-        grad_full = model.mlp.backbone[0].weight.grad
-        if grad_full.shape[1] >= 20:
-            own_grad = grad_full[:, 12:].norm().item()
-            neigh_grad = grad_full[:, :12].norm().item()
-
-    ratio = corr_norm / max(unc_norm, 1e-12)
-
-    print(f'     Loss on sample: {loss.item():.4f}')
-    print(f'     correction_head grad:  {corr_norm:.6f}')
-    print(f'     uncertainty_head grad: {unc_norm:.6f}')
-    print(f'     tau grad:              {tau_norm:.6f}')
-    if own_grad > 0:
-        print(f'     own-state grad:        {own_grad:.6f}')
-        print(f'     neighbour grad:        {neigh_grad:.6f}')
-        print(f'     own/neigh ratio:       {own_grad/max(neigh_grad, 1e-12):.2f}')
-    print(f'     corr/unc ratio:        {ratio:.4f}  '
-          f'{"✓ balanced" if 0.1 < ratio < 10 else "⚠ RACE — correction starved" if ratio < 0.1 else "⚠ RACE — uncertainty starved"}')
-    
-    # v4-specific: diagnose floor impact
-    print(f'     σ² on sample:          {sigma2.mean().item():.6f}')
-    print(f'     MSE on sample:         {((dv_pred - dv_gt_t)**2).mean().item():.6f}')
-    print(f'     σ²/MSE ratio:          {sigma2.mean().item() / max(((dv_pred - dv_gt_t)**2).mean().item(), 1e-8):.1f}x')
-    print(f'     {"✓ σ² near optimal" if sigma2.mean().item() / max(((dv_pred - dv_gt_t)**2).mean().item(), 1e-8) < 10 else "⚠ σ² floor too high"}')
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 3: Training Log Analysis (enhanced for v4)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def analyze_log(log_path: Path, label: str = 'run'):
+def analyze_log(log_path, label='run'):
     print(f'\n{SEP2}')
-    print(f'  SECTION 3: TRAINING LOG — {label.upper()}')
+    print(f'  SECTION 3: TRAINING LOG — {label}')
     print(SEP2)
 
-    log = json.loads(log_path.read_text())
-    n = len(log)
+    with open(log_path) as f:
+        log = json.load(f)
+    if not log:
+        print('  Empty log.'); return
 
-    epochs = [e['epoch'] for e in log]
-    train_nll = [e['train_nll'] for e in log]
-    val_nll = [e['val_nll'] for e in log]
-    train_mse = [e.get('train_mse', 0) for e in log]
-    sharpness = [e.get('tr_sharpness', 0) for e in log]
-    act_rate = [e.get('tr_activation_rate', 0) for e in log]
-    corr_ratio = [e.get('tr_corr_ratio', 0) for e in log]
-    err_term = [e.get('tr_error_term', 0) for e in log]
-    unc_term = [e.get('tr_uncertainty_term', 0) for e in log]
-
-    print(f'\n  ── A. Convergence summary ({n} epochs)')
-    print(f'     {"Epoch":>6}  {"TrainNLL":>10}  {"ValNLL":>10} '
-          f'{"TrainMSE":>10}  {"Sharpness":>10}  {"ActRate":>8}  {"CorrRatio":>10}')
-    print(f'     {"-"*68}')
-    show_epochs = sorted(set([1] + [e for e in [5,10,15,20,25,30,40,50,75,100] if e <= n] + [n]))
+    phases = defaultdict(list)
     for e in log:
-        if e['epoch'] in show_epochs:
-            print(f'     {e["epoch"]:>6}  {e["train_nll"]:>10.4f}  {e["val_nll"]:>10.4f}  '
-                  f'{e.get("train_mse",0):>10.6f}  {e.get("tr_sharpness",0):>10.6f}  '
-                  f'{e.get("tr_activation_rate",0):>8.4f}  {e.get("tr_corr_ratio",0):>10.4f}')
+        phases[e.get('phase', 'A')].append(e)
 
-    print(f'\n  ── B. What actually improved?')
-    nll_gain = train_nll[0] - train_nll[-1]
-    mse_gain = (train_mse[0] - train_mse[-1]) / max(abs(train_mse[0]), 1e-8) * 100
-    sharp_drop = (sharpness[0] - sharpness[-1]) / max(abs(sharpness[0]), 1e-8) * 100
-    print(f'     NLL gain (e1→e{n})     : {nll_gain:+.4f}')
-    print(f'     MSE change             : {mse_gain:+.2f}%  '
-          f'{"✓ improved" if mse_gain > 1 else "⚠ FLAT — correction head not learning"}')
-    print(f'     Sharpness change       : {sharp_drop:+.1f}%  '
-          f'{"⚠ σ² exploded" if sharp_drop < -50 else "✓ OK" if abs(sharp_drop) < 50 else "⚠ σ² collapsed"}')
+    for phase, entries in phases.items():
+        epochs = [e['epoch'] for e in entries]
+        r2s    = [e.get('tr_r2',    e.get('val_r2',    e.get('r2',    0))) for e in entries]
+        # V9 fix: read corr_ratio key (was corr_r in broken v3)
+        corr_rs = [e.get('tr_corr_ratio', e.get('val_corr_ratio',
+                   e.get('corr_ratio',    e.get('corr_r', 0)))) for e in entries]
+        ratios  = [e.get('tr_sigma2_mse_ratio_std', e.get('sigma2_mse_ratio_std', 0))
+                   for e in entries]
+        act_rates = [e.get('tr_activation_rate', e.get('activation_rate'))
+                     for e in entries]
+        act_rates = [a for a in act_rates if a is not None]
 
-    # NLL decomposition
-    if err_term[0] != 0 and unc_term[0] != 0:
-        et_change = err_term[-1] - err_term[0]
-        ut_change = unc_term[-1] - unc_term[0]
-        total_nll_change = (train_nll[-1] - train_nll[0])
-        et_pct = et_change / max(abs(total_nll_change), 1e-8) * 100
-        ut_pct = ut_change / max(abs(total_nll_change), 1e-8) * 100
-        print(f'\n  ── C. NLL decomposition: error_term vs uncertainty_term')
-        print(f'     error_term change     : {et_change:+.6f}  ({et_pct:+.1f}% of NLL Δ)')
-        print(f'     uncertainty_term Δ    : {ut_change:+.6f}  ({ut_pct:+.1f}% of NLL Δ)')
-        if abs(ut_pct) > 80 and abs(et_pct) < 20:
-            print(f'     ⚠ CRITICAL: {abs(ut_pct):.0f}% of NLL gain = σ² gaming')
-            print(f'       Correction head contributed NOTHING')
-            print(f'       Fix: Lower σ² floor or harder phase separation')
+        peak_corr  = max(corr_rs)
+        peak_ep    = epochs[corr_rs.index(peak_corr)]
+        final_corr = corr_rs[-1]
+        final_r2   = r2s[-1]
+        trend_corr = _trend(corr_rs)
 
-    # Peak detection
-    peak_idx = np.argmax(corr_ratio)
-    peak_epoch = epochs[peak_idx]
-    peak_corr = corr_ratio[peak_idx]
-    print(f'\n  ── D. Activation analysis')
-    print(f'     Peak CorrR: {peak_corr:.4f} at epoch {peak_epoch}')
-    if peak_epoch < n - 10:
-        print(f'     ⚠ CorrR peaked early then decayed — NLL phase killed learning')
-        print(f'       Post-peak decline: {peak_corr - corr_ratio[-1]:.4f}')
-    else:
-        print(f'     ✓ CorrR still climbing or stable at end')
-    print(f'     Final corr_ratio: {corr_ratio[-1]:.4f}')
-    print(f'     Ideal corr_ratio: > 0.5')
+        print(f'\n  Phase {phase}  (epochs {epochs[0]}–{epochs[-1]})')
+        print(f'  {SEP}')
+        print(f'  R²        : start={r2s[0]:.4f}  peak={max(r2s):.4f}  final={final_r2:.4f}')
+        print(f'  CorrR     : start={corr_rs[0]:.4f}  peak={peak_corr:.4f} @ep{peak_ep}  '
+              f'final={final_corr:.4f}  trend={trend_corr:+.5f}/ep')
+        if ratios[0] > 0:
+            print(f'  σ²/MSE    : start={ratios[0]:.3f}  final={ratios[-1]:.3f}')
+        if act_rates:
+            print(f'  Act.Rate  : mean={np.mean(act_rates):.3f}  final={act_rates[-1]:.3f}')
 
-    # Overfitting
-    print(f'\n  ── E. Overfitting check')
-    gap = [v - t for v, t in zip(val_nll, train_nll)]
-    print(f'     Val-Train NLL gap: e1={gap[0]:+.4f} e{n//2}={gap[n//2-1]:+.4f} e{n}={gap[-1]:+.4f}')
-    print(f'     {"⚠ overfitting" if gap[-1] > 0.5 else "✓ no overfitting"}')
+        decay = peak_corr - final_corr
+        if phase == 'B' and decay > 0.005:
+            print(f'  ⚠ Phase B eroded CorrR by {decay:.4f}')
+        if final_corr < 0.35:
+            print(f'  ⚠ CorrR {final_corr:.4f} below dataset SNR ceiling (~0.35)')
+        if abs(trend_corr) < 1e-5 and len(entries) > 10:
+            print(f'  ⚠ CorrR flat for {len(entries)} epochs — local optimum')
 
-    # Trends
-    print(f'\n  ── G. Trend velocity (last 5 epochs)')
-    nll_slope = _trend(train_nll)
-    corr_slope = _trend(corr_ratio)
-    print(f'     NLL slope:      {nll_slope:+.5f}/epoch  '
-          f'{"✓ still learning" if nll_slope < -0.02 else "⚠ plateaued"}')
-    print(f'     corr_ratio slope: {corr_slope:+.5f}/epoch  '
-          f'{"✓ improving" if corr_slope > 0.001 else "⚠ flat"}')
-
-    # v4-specific: σ²/MSE ratio trajectory
-    if len(train_mse) > 0 and len(sharpness) > 0:
-        print(f'\n  ── H. σ² calibration check')
-        ratios = [s / max(m, 1e-8) for s, m in zip(sharpness, train_mse)]
-        print(f'     σ²/MSE ratio: e1={ratios[0]:.1f} e{n//2}={ratios[n//2-1]:.1f} e{n}={ratios[-1]:.1f}')
-        if ratios[-1] > 100:
-            print(f'     ⚠ CRITICAL: σ² is {ratios[-1]:.0f}× larger than MSE')
-            print(f'       Optimal ratio: ~1.0x')
-            print(f'       Fix: Lower softplus floor from +1e-2 to +1e-6')
-
-    # Epoch 50 gate
-    if n >= 50:
-        cr_50 = corr_ratio[49] if len(corr_ratio) > 49 else corr_ratio[-1]
-        print(f'\n  ── I. Epoch-50 gate check')
-        print(f'     corr_ratio@50: {cr_50:.4f}  {"✓ PASS >0.15" if cr_50 > 0.15 else "⚠ FAIL"}')
-        if cr_50 <= 0.15:
-            print(f'     → ARCHITECTURAL BOTTLENECK')
-        elif cr_50 > 0.30 and corr_ratio[-1] < cr_50:
-            print(f'     → CorrR peaked and decayed — fix σ² floor')
-        else:
-            print(f'     → Continue training')
-
-    print(f'\n  ── F. Research verdict')
-    if mse_gain < 1 and abs(sharp_drop) > 50:
-        print(f'     ✗ DEGENERATE: σ² gaming without correction learning')
-    elif peak_epoch < n - 10 and corr_ratio[-1] < peak_corr * 0.9:
-        print(f'     ⚠ PEAK+DECAY: CorrR peaked at {peak_epoch} then collapsed')
-        print(f'       Root cause: σ² floor too high (ratio={ratios[-1]:.0f}×)')
-        print(f'       Fix: Lower floor to +1e-6, retrain from epoch {peak_epoch}')
-    elif corr_ratio[-1] > 0.3:
-        print(f'     ✓ HEALTHY: correction learning')
-    else:
-        print(f'     ~ PARTIAL: some learning but not converged')
+    if 'A' in phases and 'B' in phases:
+        a_final = phases['A'][-1]
+        b_final = phases['B'][-1]
+        a_corr  = a_final.get('tr_corr_ratio', a_final.get('corr_ratio', 0))
+        b_corr  = b_final.get('tr_corr_ratio', b_final.get('corr_ratio', 0))
+        delta   = b_corr - a_corr
+        print(f'\n  Phase A→B CorrR delta: {delta:+.4f}  '
+              f'{"✓ B improved" if delta > 0 else "⚠ B degraded"}')
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4: Feature Attribution
+# ══════════════════════════════════════════════════════════════════════════════
+
+def analyze_feature_attribution(res_dir, checkpoint=None):
+    print(f'\n{SEP2}')
+    print('  SECTION 4: FEATURE ATTRIBUTION (V9 features)')
+    print(SEP2)
+
+    frames = _load_all_residuals(res_dir, 'val', max_seqs=8)
+    if not frames:
+        frames = _load_all_residuals(res_dir, 'train', max_seqs=8)
+    if not frames:
+        print('  No data found.'); return
+
+    all_f, all_dv_x, all_dv_y = [], [], []
+    for s, dv, _ in frames:
+        f_i, _ = _build_features(s)
+        all_f.append(_normalize_features(f_i))
+        all_dv_x.extend(dv[:, 0].tolist())
+        all_dv_y.extend(dv[:, 1].tolist())
+
+    F   = np.concatenate(all_f, axis=0)
+    dvx = np.array(all_dv_x)
+    dvy = np.array(all_dv_y)
+    dvm = np.sqrt(dvx**2 + dvy**2)
+
+    print(f'\n  ── A. Input-target correlations (Pearson, val split)')
+    print(f'  {"Dim":<14} {"corr(dvx)":>10} {"corr(dvy)":>10} {"corr(|dv|)":>10}  note')
+    print(f'  {"-"*62}')
+    dim_scores = []
+    for i, name in enumerate(DIM_NAMES):
+        fi = F[:, i]
+        cx = np.corrcoef(fi, dvx)[0, 1]
+        cy = np.corrcoef(fi, dvy)[0, 1]
+        cm = np.corrcoef(fi, dvm)[0, 1]
+        score = max(abs(cx), abs(cy), abs(cm))
+        dim_scores.append((score, i, name, cx, cy, cm))
+        flag = ('✓ STRONG' if score > 0.20 else '✓ info' if score > 0.08 else '  weak')
+        print(f'  {name:<14} {cx:>10.4f} {cy:>10.4f} {cm:>10.4f}  {flag}')
+
+    dim_scores.sort(reverse=True)
+    print(f'\n  Top-5 predictive dims: '
+          + ', '.join(f'{n}({s:.3f})' for s, _, n, *_ in dim_scores[:5]))
+    dead = [n for s, _, n, *_ in dim_scores if s < 0.03]
+    if dead:
+        print(f'  Dead dims (<0.03):    {", ".join(dead)}')
+
+    # V9: check pos_spread vs own_pos redundancy (replaces old group_vel check)
+    print(f'\n  ── B. V9 feature redundancy checks')
+    for nb_i, own_i, label in [
+        (8,  12, 'pos_spread_x↔own_x1'),
+        (9,  13, 'pos_spread_y↔own_y1'),
+        (10, 16, 'vel_dev_x↔vel_devx1'),
+        (11, 17, 'vel_dev_y↔vel_devy1'),
+    ]:
+        r = np.corrcoef(F[:, nb_i], F[:, own_i])[0, 1]
+        print(f'     {label}: r={r:.4f}{"  ⚠ redundant" if abs(r) > 0.8 else ""}')
+
+    if checkpoint:
+        try:
+            sys.path.insert(0, str(Path(__file__).parent))
+            from gcmc import GCMC
+            model = GCMC(); model.eval()
+            ckpt  = torch.load(checkpoint, map_location='cpu')
+            model.load_state_dict(ckpt.get('state_dict', ckpt.get('model_state_dict', ckpt)))
+
+            print(f'\n  ── C. Per-dim gradient sensitivity (trained checkpoint)')
+            sens = np.zeros(20); n_used = 0
+            for s, dv, _ in frames[:4]:
+                if len(s) < 2: continue
+                s_t = torch.tensor(s, dtype=torch.float32)
+                with torch.enable_grad():
+                    dv_pred, _, _ = model(s_t)
+                    loss = dv_pred.pow(2).sum()
+                    if s_t.grad is not None: s_t.grad.zero_()
+                    loss.backward()
+                n_used += 1
+            if n_used > 0:
+                print(f'  [skip] direct input grad not available via model.forward — use backbone weight grad')
+        except Exception as e:
+            print(f'  [skip] {e}')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5: Correction Quality Profile
+# ══════════════════════════════════════════════════════════════════════════════
+
+def analyze_correction_quality(res_dir, checkpoint=None):
+    print(f'\n{SEP2}')
+    print('  SECTION 5: CORRECTION QUALITY PROFILE')
+    print(SEP2)
+
+    if not checkpoint:
+        print('  No checkpoint — skipping (pass --checkpoint).'); return
+
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from gcmc import GCMC
+        model = GCMC(); model.eval()
+        ckpt  = torch.load(checkpoint, map_location='cpu')
+        model.load_state_dict(ckpt.get('state_dict', ckpt.get('model_state_dict', ckpt)))
+    except Exception as e:
+        print(f'  Cannot load model: {e}'); return
+
+    frames = _load_all_residuals(res_dir, 'val', max_seqs=25)
+    if not frames:
+        print('  No val data.'); return
+
+    pred_mags, gt_mags, cos_sims, confidences = [], [], [], []
+    r2_num = r2_den = 0.0
+    seq_errors = defaultdict(list)
+
+    with torch.no_grad():
+        for s, dv_gt, seq in frames:
+            if len(s) < 2: continue
+            s_t = torch.tensor(s, dtype=torch.float32)
+            dv_pred, sigma2, _ = model(s_t)
+            dv_p = dv_pred.numpy() * DV_STD
+            """change
+            pred_mag = np.linalg.norm(dv_p, axis=1)
+            sigma2_np = sigma2.numpy()
+            conf = pred_mag / (np.sqrt(sigma2_np.mean(axis=1)) + 1e-8)
+            """
+
+            pred_mag = np.linalg.norm(dv_p, axis=1)
+            sigma2_np = sigma2.numpy()
+            # confidence in standardized space — both numerator and denominator must match
+            dv_std_mag = np.linalg.norm(dv_p / DV_STD, axis=1)
+            conf = dv_std_mag / (np.sqrt(sigma2_np.mean(axis=1)) + 1e-8)
+
+            for i in range(len(s)):
+                gm = np.linalg.norm(dv_gt[i])
+                pm = pred_mag[i]
+                pred_mags.append(pm); gt_mags.append(gm); confidences.append(conf[i])
+                if gm > 1e-8 and pm > 1e-8:
+                    cos = float(np.dot(dv_p[i], dv_gt[i]) /
+                                (np.linalg.norm(dv_p[i]) * gm))
+                    cos_sims.append(cos)
+                seq_errors[seq].append((np.sum((dv_p[i]-dv_gt[i])**2), gm))
+
+            r2_num += float(((dv_p - dv_gt)**2).sum())
+            r2_den += np.sum((dv_gt - dv_gt.mean(0))**2)
+
+    pred_mags   = np.array(pred_mags)
+    gt_mags     = np.array(gt_mags)
+    cos_sims    = np.array(cos_sims)
+    confidences = np.array(confidences)
+    gate_fires  = confidences > DV_CONF_THRESHOLD
+    r2          = 1.0 - r2_num / max(r2_den, 1e-8)
+
+    print(f'\n  ── A. Overall metrics')
+    print(f'     R²           : {r2:.4f}')
+    print(f'     CosSim mean  : {cos_sims.mean():.4f}  (>0.5: strong)')
+    print(f'     CosSim <0    : {(cos_sims < 0).mean()*100:.1f}%  (wrong direction)')
+    print(f'     Conf gate fires: {gate_fires.mean()*100:.1f}%  (threshold={DV_CONF_THRESHOLD})')
+    print(f'     Mean confidence: {confidences.mean():.3f}  std={confidences.std():.3f}')
+
+    print(f'\n  ── B. Magnitude calibration by speed bin')
+    print(f'     {"Speed bin":<20} {"n":>6} {"pred/gt":>8} {"CosSim":>8} {"conf_gate%":>10}')
+    print(f'     {"-"*54}')
+    for lo, hi in [(0, 0.001), (0.001, 0.003), (0.003, 0.01), (0.01, 0.05), (0.05, 1.0)]:
+        mask = (gt_mags >= lo) & (gt_mags < hi)
+        if mask.sum() < 5: continue
+        ratio    = (pred_mags[mask] / np.maximum(gt_mags[mask], 1e-9)).mean()
+        cs_mean  = cos_sims[mask[:len(cos_sims)]].mean() if len(cos_sims) > 0 else 0.0
+        gp       = gate_fires[mask].mean() * 100
+        print(f'     [{lo:.3f},{hi:.3f})        {mask.sum():>6d} {ratio:>8.3f} '
+              f'{cs_mean:>8.3f} {gp:>9.1f}%')
+
+    print(f'\n  ── C. Per-sequence quality (best 5 / worst 5)')
+    seq_summary = {}
+    for seq, errs in seq_errors.items():
+        rel = np.sqrt(np.mean([e[0] for e in errs])) / max(np.mean([e[1] for e in errs]), 1e-8)
+        seq_summary[seq] = rel
+    sorted_seqs = sorted(seq_summary.items(), key=lambda x: x[1])
+    print(f'  Best  5:  ' + '  '.join(f'{s}={v:.2f}' for s, v in sorted_seqs[:5]))
+    print(f'  Worst 5:  ' + '  '.join(f'{s}={v:.2f}' for s, v in sorted_seqs[-5:]))
+
+    # V9: confidence gate sweep (replaces pixel threshold sweep)
+    print(f'\n  ── D. Confidence gate sensitivity (V9)')
+    print(f'     {"threshold":>10} {"fires%":>8} {"signal_suppressed%":>20}')
+    for thresh in [0.3, 0.5, 1.0, 1.5, 2.0, 3.0]:
+        fired   = confidences > thresh
+        supp    = gt_mags[~fired]
+        lost    = (supp > gt_mags.mean()).mean() * 100 if len(supp) else 0
+        print(f'     {thresh:>10.1f} {fired.mean()*100:>7.1f}% {lost:>19.1f}%')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6: Failure Mode Taxonomy
+# ══════════════════════════════════════════════════════════════════════════════
+
+def analyze_failure_modes(res_dir, checkpoint=None):
+    print(f'\n{SEP2}')
+    print('  SECTION 6: FAILURE MODE TAXONOMY')
+    print(SEP2)
+
+    if not checkpoint:
+        print('  No checkpoint — skipping (pass --checkpoint).'); return
+
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from gcmc import GCMC
+        model = GCMC(); model.eval()
+        ckpt  = torch.load(checkpoint, map_location='cpu')
+        model.load_state_dict(ckpt.get('state_dict', ckpt.get('model_state_dict', ckpt)))
+    except Exception as e:
+        print(f'  Cannot load model: {e}'); return
+
+    frames = _load_all_residuals(res_dir, 'val', max_seqs=25)
+    if not frames: return
+
+    modes = defaultdict(int)
+    total = 0
+
+    with torch.no_grad():
+        for s, dv_gt, seq in frames:
+            if len(s) < 2: continue
+            s_t = torch.tensor(s, dtype=torch.float32)
+            dv_pred, sigma2, _ = model(s_t)
+            dv_p = dv_pred.numpy() * DV_STD
+
+            pred_mag  = np.linalg.norm(dv_p, axis=1)
+            gt_mag    = np.linalg.norm(dv_gt, axis=1)
+            sigma2_np = sigma2.numpy()
+            # V9 confidence gate
+            """change
+            conf = pred_mag / (np.sqrt(sigma2_np.mean(axis=1)) + 1e-8)
+            """
+            dv_std_mag = np.linalg.norm(dv_p / DV_STD, axis=1)
+            conf = dv_std_mag / (np.sqrt(sigma2_np.mean(axis=1)) + 1e-8)
+
+            
+            fired = conf > DV_CONF_THRESHOLD
+
+            for i in range(len(s)):
+                total += 1
+                gm = gt_mag[i]; pm = pred_mag[i]
+
+                if gm < 1e-4 and not fired[i]:
+                    modes['TN: both near-zero'] += 1
+                elif gm < 1e-4 and fired[i]:
+                    modes['FP: spurious correction'] += 1
+                elif gm >= 1e-4 and not fired[i]:
+                    modes['FN: gate suppressed signal'] += 1
+                else:
+                    cos = float(np.dot(dv_p[i], dv_gt[i]) /
+                                (np.linalg.norm(dv_p[i]) * gm + 1e-9))
+                    mag_ratio = pm / max(gm, 1e-9)
+                    if cos < 0:
+                        modes['TP-wrong-dir: wrong direction'] += 1
+                    elif mag_ratio < 0.2:
+                        modes['TP-under: severe underestimation'] += 1
+                    elif mag_ratio > 5.0:
+                        modes['TP-over: severe overestimation'] += 1
+                    elif cos > 0.5:
+                        modes['TP-good: correct direction+scale'] += 1
+                    else:
+                        modes['TP-partial: weak alignment'] += 1
+
+    print(f'\n  Total predictions: {total:,}')
+    print(f'\n  {"Mode":<45} {"count":>8} {"pct":>7}')
+    print(f'  {"-"*62}')
+    for mode, cnt in sorted(modes.items(), key=lambda x: -x[1]):
+        print(f'  {mode:<45} {cnt:>8,} {100*cnt/total:>6.1f}%')
+
+    tp_good   = modes.get('TP-good: correct direction+scale', 0)
+    fp_spur   = modes.get('FP: spurious correction', 0)
+    fn_gate   = modes.get('FN: gate suppressed signal', 0)
+    wrong_dir = modes.get('TP-wrong-dir: wrong direction', 0)
+
+    print(f'\n  V9 gate effectiveness vs V7 baseline:')
+    print(f'  TP-good target: >31.0% (V7 baseline)')
+    print(f'  FN target     : <16.0% (V7 baseline)')
+    print(f'  Wrong-dir target: <26.6% (V7 baseline)')
+    print(f'  FP target     : <9.0% (V7 baseline)')
+    print()
+    if fp_spur / max(total, 1) > 0.09:
+        print(f'  ⚠ FP {100*fp_spur/total:.1f}% above V7 baseline — confidence gate too loose')
+    if fn_gate / max(total, 1) > 0.16:
+        print(f'  ⚠ FN {100*fn_gate/total:.1f}% above V7 baseline — confidence gate too tight')
+    if wrong_dir / max(total, 1) > 0.266:
+        print(f'  ⚠ Wrong-dir {100*wrong_dir/total:.1f}% above V7 — V9 feature changes not helping direction')
+    if tp_good / max(total, 1) > 0.31:
+        print(f'  ✓ TP-good {100*tp_good/total:.1f}% exceeds V7 baseline')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7: Improvement Recommendations
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_recommendations(res_dir, log_path=None, checkpoint=None):
+    print(f'\n{SEP2}')
+    print('  SECTION 7: STATUS & RECOMMENDATIONS')
+    print(SEP2)
+
+    print(f'\n  V9 implemented changes:')
+    print(f'  ✓ [ARCH]  pos_spread replaces group_vel (dims 8-9)')
+    print(f'  ✓ [ARCH]  own_vel → vel_deviation from group (dims 16-19)')
+    print(f'  ✓ [TRAIN] Phase B freezes backbone — uncertainty head only')
+    print(f'  ✓ [INFRA] Confidence gate replaces hard pixel threshold')
+
+    issues = []
+
+    if log_path and Path(log_path).exists():
+        with open(log_path) as f:
+            log = json.load(f)
+        corr_rs = [e.get('tr_corr_ratio', e.get('corr_ratio', 0)) for e in log]
+        phases  = [e.get('phase', 'A') for e in log]
+        a_vals  = [c for c, p in zip(corr_rs, phases) if p == 'A']
+        b_vals  = [c for c, p in zip(corr_rs, phases) if p == 'B']
+
+        if a_vals and max(a_vals) < 0.40:
+            issues.append(('ARCH', 'CorrR still below 0.40',
+                f'Peak CorrR={max(a_vals):.4f}. V9 feature changes may not have broken '
+                f'the SNR ceiling. If still at ~0.33, the remaining lever is input '
+                f'noise reduction: whiten dv_star targets per-sequence before training.'))
+        if b_vals and a_vals and b_vals[-1] < a_vals[-1] - 0.003:
+            issues.append(('TRAIN', 'Phase B still eroding CorrR',
+                f'Backbone freeze (Change 2) should have fixed this. '
+                f'If still degrading, verify optimizer_B only covers uncertainty_head.parameters().'))
+
+    issues.extend([
+        ('ARCH', 'SNR ceiling — target whitening',
+         'Dataset SNR=4.5x is the hard limit. To push CorrR > 0.40: '
+         'normalise dv_star targets per-sequence (zero-mean, unit-std per seq). '
+         'This removes sequence-level bias from targets without changing the model.'),
+
+        ('ARCH', 'Attention collapse risk',
+         'With DanceTrack group sizes p95=24, softmax attention over 24 neighbours '
+         'with tau=0.05 may collapse to top-1. Monitor attention entropy in §2. '
+         'If entropy < 0.5, increase tau_init to 0.10.'),
+
+        ('EVAL', 'SORT exclusion',
+         'SORT degrades by design (no robust re-matching). '
+         'Exclude from primary evaluation — report ByteTrack and OC-SORT only.'),
+    ])
+
+    priority = {'ARCH': '🔴 HIGH', 'TRAIN': '🟡 MED', 'INFRA': '🟡 MED', 'EVAL': '🟢 LOW'}
+
+    print(f'\n  Remaining issues:')
+    print(f'\n  {"#":<3} {"Priority":<10} {"Category":<8} {"Issue"}')
+    print(f'  {"-"*70}')
+    for i, (cat, title, _) in enumerate(issues, 1):
+        print(f'  {i:<3} {priority[cat]:<10} {cat:<8} {title}')
+
+    print(f'\n  Detail:')
+    for i, (cat, title, detail) in enumerate(issues, 1):
+        print(f'\n  [{i}] {priority[cat]} {cat}: {title}')
+        words = detail.split(); line = '      '
+        for w in words:
+            if len(line) + len(w) + 1 > 72:
+                print(line); line = '      ' + w + ' '
+            else:
+                line += w + ' '
+        if line.strip(): print(line)
+
+    print(f'\n  {SEP}')
+    print(f'  V9 gate checks (eval after ep40):')
+    print(f'     CorrR     > 0.38  (V7 peak: 0.3317)')
+    print(f'     R²        > 0.53')
+    print(f'     CosSim    > 0.22  (V7: 0.200)')
+    print(f'     TP-good   > 31%   (V7 baseline)')
+    print(f'     FP rate   < 9%    (V7 baseline)')
+    print(f'     Wrong-dir < 26.6% (V7 baseline)')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main
-# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--residuals', default='residuals')
-    parser.add_argument('--log', default=None)
-    parser.add_argument('--log2', default=None)
-    parser.add_argument('--mode', default='full',
-                        choices=['data', 'model', 'log', 'full', 'compare'])
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--residuals',  default='residuals')
+    p.add_argument('--log',        default=None)
+    p.add_argument('--log2',       default=None)
+    p.add_argument('--checkpoint', default=None)
+    p.add_argument('--mode',       default='full',
+                   choices=['data','model','log','attribution','quality',
+                             'failures','recommend','full','report','compare'])
+    args = p.parse_args()
 
-    res = Path(args.residuals)
+    res     = Path(args.residuals)
+    run_all = args.mode in ('full', 'report')
 
-    if args.mode in ('data', 'full'):
+    if run_all or args.mode == 'data':
         analyze_data(res)
-
-    if args.mode in ('model', 'full'):
-        log_p = Path(args.log) if args.log else None
-        analyze_model(res, log_path=log_p)
-
-    if args.mode in ('log', 'full') and args.log:
+    if run_all or args.mode == 'model':
+        analyze_model(res)
+    if (run_all or args.mode == 'log') and args.log:
         analyze_log(Path(args.log), label=args.log)
-
+    if run_all or args.mode == 'attribution':
+        analyze_feature_attribution(res, checkpoint=args.checkpoint)
+    if run_all or args.mode == 'quality':
+        analyze_correction_quality(res, checkpoint=args.checkpoint)
+    if run_all or args.mode == 'failures':
+        analyze_failure_modes(res, checkpoint=args.checkpoint)
+    if run_all or args.mode in ('recommend', 'report'):
+        generate_recommendations(res, log_path=args.log, checkpoint=args.checkpoint)
     if args.mode == 'compare' and args.log and args.log2:
-        analyze_log(Path(args.log), label='run1')
-        analyze_log(Path(args.log2), label='run2')
+        analyze_log(Path(args.log),  label='v_prev')
+        analyze_log(Path(args.log2), label='v_new')
 
     print(f'\n{SEP2}\n')
 

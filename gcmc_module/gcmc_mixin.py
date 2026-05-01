@@ -8,11 +8,11 @@ gcmc_mixin.py — Shared GCMC injection logic v2
 from __future__ import annotations
 import numpy as np
 import torch
-from gcmc_module.gcmc import GCMC, fanout_numpy, build_Q_aug
+from gcmc_module_V10_claude.gcmc import GCMC, fanout_numpy, build_Q_aug
 
 IM_W_DEFAULT = 1920.0
 IM_H_DEFAULT = 1080.0
-DV_MIN_PX    = 0.5   # ignore corrections smaller than this (noise gate)
+DV_CONF_THRESHOLD = 1   # fire if |dv_pred_norm| / sqrt(mean_sigma2) > this
 
 
 class GCMCModule:
@@ -45,10 +45,19 @@ class GCMCModule:
         dv_px      = dv_norm * np.array([im_w, im_h], dtype=np.float32)  # (N,2)
         correction = fanout_numpy(dv_px)                                   # (N,8)
 
-        # Noise gate: skip corrections smaller than DV_MIN_PX
-        dv_mag = np.linalg.norm(dv_px, axis=1)   # (N,)
-        mask   = dv_mag > DV_MIN_PX
+        # Confidence gate: fire when prediction magnitude exceeds uncertainty
+        
+        dv_pred_mag = np.linalg.norm(dv_norm, axis=1)
+        confidence  = dv_pred_mag / (np.sqrt(sigma2.mean(axis=1)) + 1e-8)
+        """
+        DV_STD = np.array([0.004789, 0.006376])
+        dv_norm_std = dv_norm / DV_STD          # back to standardized space
+        dv_std_mag  = np.linalg.norm(dv_norm_std, axis=1)
+        confidence  = dv_std_mag / (np.sqrt(sigma2.mean(axis=1)) + 1e-8)
+        """
 
+        mask        = confidence > DV_CONF_THRESHOLD
+        
         corrected = []
         for i in range(N):
             if mask[i]:
